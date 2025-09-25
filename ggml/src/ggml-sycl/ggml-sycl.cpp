@@ -38,6 +38,7 @@
 
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/conv.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/gemm.hpp"
@@ -3551,6 +3552,10 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_CONV_TRANSPOSE_1D:
             ggml_sycl_op_conv_transpose_1d(ctx, dst);
             break;
+        case GGML_OP_CONV_2D:
+            fprintf(stderr, "🚀 SYCL Dispatcher: Conv2D operation detected - calling our implementation!\n");
+            ggml_sycl_op_conv_2d(ctx, dst);
+            break;
         case GGML_OP_REPEAT:
             ggml_sycl_repeat(ctx, dst);
             break;
@@ -4157,6 +4162,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_CONV_TRANSPOSE_1D:
+            {
+                ggml_type src0_type = op->src[0]->type;
+                ggml_type src1_type = op->src[1]->type;
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                return false;
+            }
+        case GGML_OP_CONV_2D:
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
