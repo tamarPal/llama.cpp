@@ -45,72 +45,8 @@
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/quantize.hpp"
+#include "ggml-sycl/roll.hpp"
 #include "ggml.h"
-
-// --- Minimal host-side implementation for ROLL (F32, 1D/2D single-axis) ---
-static void ggml_sycl_roll(ggml_backend_sycl_context & ctx, ggml_tensor * op) {
-    (void)ctx; // not used in minimal host impl
-    GGML_ASSERT(op->op == GGML_OP_ROLL);
-
-    if (op->type != GGML_TYPE_F32) {
-        GGML_ABORT("SYCL ROLL minimal: only F32 supported");
-    }
-
-    struct ggml_tensor * a = op->src[0];
-    const int64_t ne0 = op->ne[0];
-    const int64_t ne1 = op->ne[1];
-
-    const int32_t s0  = op->op_params[0];
-    const int32_t s1  = op->op_params[1];
-
-    const float *src = (const float *) a->data;
-    float *dst       = (float *) op->data;
-
-    if (ne1 == 1) {
-        // 1D roll on axis 0
-        const int64_t N = ne0;
-        int64_t sh = s0 % (int32_t)N; if (sh < 0) sh += N;
-        for (int64_t i = 0; i < N; ++i) {
-            int64_t j = i - sh; j %= N; if (j < 0) j += N;
-            dst[i] = src[j];
-        }
-        return;
-    }
-
-    // 2D: support single-axis shift only
-    const bool axis0 = (s0 != 0) && (s1 == 0);
-    const bool axis1 = (s1 != 0) && (s0 == 0);
-
-    if (!axis0 && !axis1) {
-        GGML_ABORT("SYCL ROLL minimal: supports only 1D or 2D single-axis");
-    }
-
-    const int64_t cols = ne0;
-    const int64_t rows = ne1;
-
-    if (axis0) {
-        int64_t sh = s0 % (int32_t)cols; if (sh < 0) sh += cols;
-        for (int64_t r = 0; r < rows; ++r) {
-            const float *row_in  = src + r*cols;
-            float *row_out       = dst + r*cols;
-            for (int64_t c = 0; c < cols; ++c) {
-                int64_t cc = c - sh; cc %= cols; if (cc < 0) cc += cols;
-                row_out[c] = row_in[cc];
-            }
-        }
-    } else {
-        int64_t sh = s1 % (int32_t)rows; if (sh < 0) sh += rows;
-        for (int64_t r = 0; r < rows; ++r) {
-            int64_t rr = r - sh; rr %= rows; if (rr < 0) rr += rows;
-            const float *row_in  = src + rr*cols;
-            float *row_out       = dst +  r*cols;
-            for (int64_t c = 0; c < cols; ++c) {
-                row_out[c] = row_in[c];
-            }
-        }
-    }
-}
-
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
@@ -3628,11 +3564,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_GET_ROWS:
             ggml_sycl_get_rows(ctx, dst);
-            break;case GGML_OP_SET_ROWS:
-            ggml_sycl_op_set_rows(ctx, dst);
             break;
-        case GGML_OP_ROLL:
-            ggml_sycl_roll(ctx, dst);
+        case GGML_OP_SET_ROWS:
+            ggml_sycl_op_set_rows(ctx, dst);
             break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
@@ -4234,12 +4168,55 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     switch (op->op) {
-        case GGML_OP_ROLL:
-            return (op->type == GGML_TYPE_F32) && ggml_is_contiguous(op->src[0]);case GGML_OP_MUL_MAT:
+        case GGML_OP_CONV_TRANSPOSE_1D:
+            {
+                ggml_type src0_type = op->src[0]->type;
+                ggml_type src1_type = op->src[1]->type;
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                return false;
+            }
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_NEG:
+                case GGML_UNARY_OP_STEP:
+                case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_HARDSIGMOID:
+                case GGML_UNARY_OP_HARDSWISH:
+                case GGML_UNARY_OP_GELU_QUICK:
+                case GGML_UNARY_OP_GELU_ERF:
+                case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_ELU:
+#if defined (GGML_SYCL_F16)
+                    return ggml_is_contiguous(op->src[0]) && (op->type == op->src[0]->type);
+#else
+                    return ggml_is_contiguous(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) && (op->type == op->src[0]->type);
+#endif
+                default:
+                    return false;
+            }
+        case GGML_OP_GLU:
+            switch (ggml_get_glu_op(op)) {
+                case GGML_GLU_OP_REGLU:
+                case GGML_GLU_OP_GEGLU:
+                case GGML_GLU_OP_SWIGLU:
+                case GGML_GLU_OP_GEGLU_ERF:
+                case GGML_GLU_OP_GEGLU_QUICK:
+                    return ggml_is_contiguous_1(op->src[0]);
+                default:
+                    return false;
+            }
+            break;
+        case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
-    // FORCE: allow ROLL in SYCL for debugging
-    // TEMP: do not force ROLL support
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
 
@@ -4289,7 +4266,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     default:
                         return false;
                 }
-            }case GGML_OP_SET_ROWS:
+            }
+        case GGML_OP_SET_ROWS:
             {
                 return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                          op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||

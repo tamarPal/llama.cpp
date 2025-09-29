@@ -1,0 +1,8 @@
+Testing 2 devices
+
+Backend 1/2: SYCL0
+  Skipping
+Backend 2/2: CPU
+  Skipping
+2/2 backends passed
+[1;32mOK[0m
