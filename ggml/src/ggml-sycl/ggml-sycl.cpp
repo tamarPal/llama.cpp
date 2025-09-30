@@ -3632,7 +3632,11 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_op_set_rows(ctx, dst);
             break;
         case GGML_OP_ROLL:
-            ggml_sycl_roll(ctx, dst);
+{
+    ggml_sycl_roll(ctx, dst);
+    break;
+}
+ggml_sycl_roll(ctx, dst);
             break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
