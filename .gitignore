@@ -152,3 +152,6 @@ poetry.toml
 # Code Workspace
 *.code-workspace
 
+
+# ignore local roll backups
+ ggml/src/ggml-sycl/roll.cpp.bak*
