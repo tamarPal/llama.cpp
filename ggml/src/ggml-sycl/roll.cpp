@@ -1,91 +1,100 @@
 #include <sycl/sycl.hpp>
+#include <cstdio>
+#include <cstring>
 #include "ggml.h"
-#include "common.hpp"
 
-// קרנל כללי ל-f32 / f16
-template<typename T>
-static void kernel_roll_impl(
-    sycl::queue &q,
-    const T* src, T* dst,
-    const int64_t *ne_in,
-    const size_t  *nb_in,
-    int64_t s0, int64_t s1, int64_t s2, int64_t s3) {
+// אין תלות ב-helpers פנימיים; פותחים תור GPU מקומי
+using namespace sycl;
 
-    // נעתיק לערכים לוקאליים כדי לא לקרוא מהוסט בתוך הקרנל
-    const int64_t n0 = ne_in[0], n1 = ne_in[1], n2 = ne_in[2], n3 = ne_in[3];
-    const size_t  nb0 = nb_in[0], nb1 = nb_in[1], nb2 = nb_in[2], nb3 = nb_in[3];
+static void kernel_roll_impl(queue &q,
+                             const ggml_tensor *src,
+                             ggml_tensor *dst,
+                             int axis, int shift) {
+    // בדיקות בסיס
+    if (!src || !dst) throw std::runtime_error("null tensor");
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
+        throw std::runtime_error("only F32 supported in SYCL roll (for test)");
+    if (axis < 0 || axis > 3) throw std::runtime_error("axis out of range");
 
-    auto norm_shift = [](int64_t s, int64_t n) -> int64_t {
-        if (n <= 0) return 0;
-        int64_t r = s % n; if (r < 0) r += n; return r;
-    };
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+    const int64_t ne3 = dst->ne[3];
 
-    const int64_t rs0 = norm_shift(s0, n0);
-    const int64_t rs1 = norm_shift(s1, n1);
-    const int64_t rs2 = norm_shift(s2, n2);
-    const int64_t rs3 = norm_shift(s3, n3);
+    // התאמת ממדים למקור
+    if (ne0 != src->ne[0] || ne1 != src->ne[1] || ne2 != src->ne[2] || ne3 != src->ne[3])
+        throw std::runtime_error("src/dst shape mismatch");
 
-    const int64_t total = (n0>0 && n1>0 && n2>0 && n3>0) ? (n0 * n1 * n2 * n3) : 0;
-    if (total == 0) return;
+    const int64_t len = dst->ne[axis];
+    if (len <= 0) throw std::runtime_error("len <= 0");
 
-    q.parallel_for(sycl::range<1>(static_cast<size_t>(total)), [=](sycl::id<1> tid) {
-        int64_t i = static_cast<int64_t>(tid[0]);
+    // shift חיובי בתחום [0, len)
+    const int64_t sh = ((int64_t)shift % len + len) % len;
 
-        int64_t i0 = i % n0;      i /= n0;
-        int64_t i1 = i % n1;      i /= n1;
-        int64_t i2 = i % n2;      i /= n2;
-        int64_t i3 = i;
+    const size_t total_elems = (size_t)ne0 * (size_t)ne1 * (size_t)ne2 * (size_t)ne3;
+    const size_t total_bytes = total_elems * sizeof(float);
 
-        const int64_t j0 = (i0 - rs0 + n0) % n0;
-        const int64_t j1 = (i1 - rs1 + n1) % n1;
-        const int64_t j2 = (i2 - rs2 + n2) % n2;
-        const int64_t j3 = (i3 - rs3 + n3) % n3;
+    // מצביעי ה-host
+    const float *h_src = (const float*) src->data;
+    float *h_dst = (float*) dst->data;
+    if (!h_src || !h_dst) throw std::runtime_error("null data pointers");
 
-        const size_t off_src = (size_t)j0 * nb0 + (size_t)j1 * nb1 + (size_t)j2 * nb2 + (size_t)j3 * nb3;
-        const size_t off_dst = (size_t)i0 * nb0 + (size_t)i1 * nb1 + (size_t)i2 * nb2 + (size_t)i3 * nb3;
+    // USM משותף — קריא/כתיב מה-CPU ומה-GPU
+    float *usm_src = (float*) malloc_shared(total_bytes, q);
+    float *usm_dst = (float*) malloc_shared(total_bytes, q);
+    if (!usm_src || !usm_dst) throw std::runtime_error("malloc_shared failed");
 
-        const T* psrc = (const T*)((const char*)src + off_src);
-        T*       pdst = (T*)      ((      char*)dst + off_dst);
-        *pdst = *psrc;
+    // העתקות host<->usm
+    std::memcpy(usm_src, h_src, total_bytes);
+    std::memset(usm_dst, 0, total_bytes);
+
+    // kernel: פריסה פשוטה (i3,i2,i1) לולאה פנימית על i0
+    q.submit([&](handler &h) {
+        range<3> r((size_t)ne3, (size_t)ne2, (size_t)ne1);
+        h.parallel_for(r, [=](id<3> idx) {
+            int64_t i3 = (int64_t)idx[0];
+            int64_t i2 = (int64_t)idx[1];
+            int64_t i1 = (int64_t)idx[2];
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                int64_t s0=i0, s1=i1, s2=i2, s3=i3;
+                if (axis==0) s0 = (i0 - sh + ne0) % ne0;
+                if (axis==1) s1 = (i1 - sh + ne1) % ne1;
+                if (axis==2) s2 = (i2 - sh + ne2) % ne2;
+                if (axis==3) s3 = (i3 - sh + ne3) % ne3;
+
+                size_t src_idx = (size_t)(((s3*ne2 + s2)*ne1 + s1)*ne0 + s0);
+                size_t dst_idx = (size_t)(((i3*ne2 + i2)*ne1 + i1)*ne0 + i0);
+
+                // שמירה בטוחה
+                usm_dst[dst_idx] = usm_src[src_idx];
+            }
+        });
     }).wait();
+
+    // החזרת תוצאה ל-host
+    std::memcpy(h_dst, usm_dst, total_bytes);
+
+    sycl::free(usm_src, q);
+    sycl::free(usm_dst, q);
 }
 
-// חתימת ה-forward כפי שנקראת מ-ggml-sycl.cpp
-bool ggml_sycl_compute_forward_roll(ggml_backend_sycl_context &ctx, const ggml_tensor *src, ggml_tensor *dst) {
-    GGML_ASSERT(src != nullptr && dst != nullptr);
-
-    // 4 שיפטים (int32) ב-op_params: shift0..shift3
-    const int32_t *op_params = (const int32_t *) dst->op_params;
-    const int64_t s0 = (int64_t)op_params[0];
-    const int64_t s1 = (int64_t)op_params[1];
-    const int64_t s2 = (int64_t)op_params[2];
-    const int64_t s3 = (int64_t)op_params[3];
-
-    const int64_t *ne = dst->ne;
-    const size_t  *nb = dst->nb;
-
-    const void * src_data = src->data;
-    void       * dst_data = dst->data;
-
-    // הבאת queue באופן קנוני ב-SYCL backend של GGML:
-    auto stream = ctx.stream();
-    sycl::queue &q = *stream;
-
-    switch (ggml_element_size(dst)) {
-    case sizeof(float):
-        kernel_roll_impl<float>(q,
-            (const float*)src_data, (float*)dst_data,
-            ne, nb, s0, s1, s2, s3);
-        break;
-    case sizeof(ggml_fp16_t):
-        kernel_roll_impl<ggml_fp16_t>(q,
-            (const ggml_fp16_t*)src_data, (ggml_fp16_t*)dst_data,
-            ne, nb, s0, s1, s2, s3);
-        break;
-    default:
-        GGML_ABORT("roll: unsupported type on SYCL");
-        return false;
+// API יציב ל-backend שלנו
+extern "C" void ggml_sycl_roll(ggml_tensor * dst,
+                               const ggml_tensor * src,
+                               int axis, int shift) {
+    try {
+        queue q{ gpu_selector_v };
+        kernel_roll_impl(q, src, dst, axis, shift);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[SYCL-ROLL] ERROR: %s\n", e.what());
+        throw;
     }
+}
 
-    return true;
+// שמירה על התאימות לטסטים/קריאות ישנות
+extern "C" void ggml_sycl_roll_probe(ggml_tensor * src,
+                                     ggml_tensor * dst,
+                                     int axis,
+                                     long long shift) {
+    ggml_sycl_roll(dst, src, axis, (int)shift);
 }
