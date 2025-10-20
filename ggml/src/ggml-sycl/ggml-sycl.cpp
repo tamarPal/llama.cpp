@@ -4494,8 +4494,14 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
-        case GGML_OP_ROLL:
-            return op->type == GGML_TYPE_F32;
+        case GGML_OP_ROLL: {
+            const ggml_tensor *src0 = op->src[0];
+            // Support both F32 and F16
+            const bool valid_src_type = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+            const bool valid_dst_type = (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+            const bool types_match = (src0->type == op->type);
+            return valid_src_type && valid_dst_type && types_match;
+        }       
         case GGML_OP_ARANGE:
             return op->type == GGML_TYPE_F32;
         default:

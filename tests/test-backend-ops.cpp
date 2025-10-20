@@ -4994,6 +4994,24 @@ struct test_roll : public test_case {
     }
 };
 
+// Test ROLL with F16 - simple test
+struct test_roll_f16_simple : public test_case {
+    std::string vars() override {
+        return "type=f16,shift0=1,shift1=0,shift3=0,shift4=0";
+    }
+    
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        int64_t ne[4] = {4, 2, 1, 1};  // Small 4x2 tensor
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F16, 2, ne);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_roll(ctx, a, 1, 0, 0, 0);  // Simple shift by 1
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ARANGE
 struct test_arange : public test_case {
     const ggml_type type;
@@ -5793,6 +5811,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // ROLL test
+    test_cases.emplace_back(new test_roll());
+    
+    // Add F16 ROLL test only for SYCL (commenting out until CPU backend supports it)
+    test_cases.emplace_back(new test_roll_f16_simple());
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -6774,7 +6798,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_ext());
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
-    test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());
